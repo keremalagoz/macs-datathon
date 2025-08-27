@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments / env files
+.venv/
+venv/
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Data folders (keep structure via .gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+
+data/external/*
+!data/external/.gitkeep
+
+data/interim/*
+!data/interim/.gitkeep
+
+data/processed/*
+!data/processed/.gitkeep
+
+# Reports (keep figures folder only)
+reports/figures/*
+!reports/figures/.gitkeep
+
+# Submissions (keep folder)
+submissions/*
+!submissions/.gitkeep
+
+# Experiments (keep folder)
+experiments/*
+!experiments/.gitkeep
