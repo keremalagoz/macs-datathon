@@ -20,7 +20,7 @@ Girdi:
 from __future__ import annotations
 import os
 import sys
-from typing import List, Tuple
+from typing import List, Tuple, Callable
 
 import numpy as np
 import pandas as pd
@@ -85,6 +85,7 @@ def mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def main() -> int:
     backend = os.getenv("MODEL_BACKEND", "lgbm").strip().lower()
+    target_transform = os.getenv("TARGET_TRANSFORM", "log1p").strip().lower()
     print(f"[model_lgbm_v1] reading data and features... (backend={backend})")
     train, sample_sub = _read_raw()
     feat_tr = _read_features("session_features_v1_train")
@@ -104,10 +105,9 @@ def main() -> int:
     # Feature set: user_session/user_id/target hariç tüm sayısal sütunlar
     drop_cols = {"user_session", "user_id", "session_value"}
     raw_feature_cols = [c for c in df.columns if c not in drop_cols]
-    # BUY ile ilgili feature'ları hariç tut (olas sznt)
-    feature_cols = [c for c in raw_feature_cols if "BUY" not in c]
-    removed = sorted(set(raw_feature_cols) - set(feature_cols))
-    print(f"[model_lgbm_v1] selected {len(feature_cols)} feature cols (removed BUY cols: {removed})")
+    # BUY feature'larını geri ekliyoruz (testte de mevcut; leakage değil)
+    feature_cols = raw_feature_cols
+    print(f"[model_lgbm_v1] selected {len(feature_cols)} feature cols (BUY features included)")
 
     print("[model_lgbm_v1] building matrices X/y/groups...")
     X = df[feature_cols].fillna(0.0).to_numpy(dtype=float)
@@ -146,6 +146,17 @@ def main() -> int:
         raise ValueError(f"Bilinmeyen backend: {backend}")
 
     print(f"[model_lgbm_v1] features: {len(feature_cols)} cols, samples: {len(y)}")
+
+    # Hedef dönüşümü
+    def _tf_y(arr: np.ndarray) -> np.ndarray:
+        if target_transform == "log1p":
+            return np.log1p(np.clip(arr, a_min=0.0, a_max=None))
+        return arr
+
+    def _inv_y(arr: np.ndarray) -> np.ndarray:
+        if target_transform == "log1p":
+            return np.expm1(arr)
+        return arr
 
     oof = np.zeros_like(y, dtype=float)
     test_pred = np.zeros(len(feat_te), dtype=float)
@@ -189,8 +200,8 @@ def main() -> int:
                 lgb.log_evaluation(period=100),
             ]
             model.fit(
-                X_tr, y_tr,
-                eval_set=[(X_va, y_va)],
+                X_tr, _tf_y(y_tr),
+                eval_set=[(X_va, _tf_y(y_va))],
                 eval_metric="l2",
                 callbacks=callbacks,
             )
@@ -208,8 +219,8 @@ def main() -> int:
             )
             print(f"[model_lgbm_v1] training fold {i} (XGB)...")
             model.fit(
-                X_tr, y_tr,
-                eval_set=[(X_va, y_va)],
+                X_tr, _tf_y(y_tr),
+                eval_set=[(X_va, _tf_y(y_va))],
                 eval_metric="rmse",
                 early_stopping_rounds=50,
                 verbose=100,
@@ -217,28 +228,28 @@ def main() -> int:
         else:  # sklearn HistGradientBoosting
             model = HistGradientBoostingRegressor(
                 learning_rate=0.05,
-                max_iter=500,
-                max_leaf_nodes=31,
+                max_iter=600,
+                max_leaf_nodes=63,
                 min_samples_leaf=20,
                 l2_regularization=0.0,
                 early_stopping=True,
-                n_iter_no_change=50,
+                n_iter_no_change=30,
                 validation_fraction=0.2,
                 random_state=RANDOM_SEED,
             )
             print(f"[model_lgbm_v1] training fold {i} (SK-HGB)...")
-            model.fit(X_tr, y_tr)
+            model.fit(X_tr, _tf_y(y_tr))
             print(f"[model_lgbm_v1] fold {i} training done (SK-HGB)")
         # Not: early_stopping_rounds ile en iyi iterasyona göre duracaktır.
-
-        pred_va = model.predict(X_va)
+        
+        pred_va = _inv_y(model.predict(X_va))
         oof[va_idx] = pred_va
         fold_mse = mse(y_va, pred_va)
         fold_scores.append(fold_mse)
-    print(f"Fold {i}: val_MSE={fold_mse:.6f} (n_tr={len(tr_idx)} n_va={len(va_idx)})")
+        print(f"Fold {i}: val_MSE={fold_mse:.6f} (n_tr={len(tr_idx)} n_va={len(va_idx)})")
 
-    # Test tahmini (best_iteration_ varsa kullanır)
-    test_pred += model.predict(X_te) / N_SPLITS
+        # Test tahmini — her fold modelinden toplayıp ortalıyoruz
+        test_pred += _inv_y(model.predict(X_te)) / N_SPLITS
 
     oof_mse = mse(y, oof)
     print(f"OOF MSE: {oof_mse:.6f}")
@@ -251,12 +262,15 @@ def main() -> int:
     # sample_submission kullanıcı oturum sırasını koruyoruz
     pred_map = dict(zip(feat_te["user_session"].values, test_pred))
     sub["session_value"] = sub["user_session"].map(pred_map).astype(float)
+    # Güvenlik: eksik kalan varsa global ortalamayla doldur
+    if sub["session_value"].isna().any():
+        sub["session_value"].fillna(float(y.mean()), inplace=True)
 
     os.makedirs(SUB_DIR, exist_ok=True)
     out_name_map = {
-        "lgbm": "lgbm_v1_minimal_nobuy_backoff.csv",
-        "xgb": "xgb_v1_minimal_nobuy_backoff.csv",
-        "sk": "sk_v1_minimal_nobuy_backoff.csv",
+        "lgbm": "lgbm_v1_minimal_buy_backoff_log.csv" if target_transform == "log1p" else "lgbm_v1_minimal_buy_backoff.csv",
+        "xgb": "xgb_v1_minimal_buy_backoff_log.csv" if target_transform == "log1p" else "xgb_v1_minimal_buy_backoff.csv",
+        "sk": "sk_v1_minimal_buy_backoff_log.csv" if target_transform == "log1p" else "sk_v1_minimal_buy_backoff.csv",
     }
     out_name = out_name_map.get(backend, "model_v1_minimal_nobuy_backoff.csv")
     out_csv = os.path.join(SUB_DIR, out_name)
