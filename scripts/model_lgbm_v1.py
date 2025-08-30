@@ -84,7 +84,8 @@ def mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def main() -> int:
-    print("[model_lgbm_v1] reading data and features...")
+    backend = os.getenv("MODEL_BACKEND", "lgbm").strip().lower()
+    print(f"[model_lgbm_v1] reading data and features... (backend={backend})")
     train, sample_sub = _read_raw()
     feat_tr = _read_features("session_features_v1_train")
     feat_te = _read_features("session_features_v1_test")
@@ -102,60 +103,139 @@ def main() -> int:
 
     # Feature set: user_session/user_id/target hariç tüm sayısal sütunlar
     drop_cols = {"user_session", "user_id", "session_value"}
-    feature_cols = [c for c in df.columns if c not in drop_cols]
-    print(f"[model_lgbm_v1] selected {len(feature_cols)} feature cols")
+    raw_feature_cols = [c for c in df.columns if c not in drop_cols]
+    # BUY ile ilgili feature'ları hariç tut (olas sznt)
+    feature_cols = [c for c in raw_feature_cols if "BUY" not in c]
+    removed = sorted(set(raw_feature_cols) - set(feature_cols))
+    print(f"[model_lgbm_v1] selected {len(feature_cols)} feature cols (removed BUY cols: {removed})")
 
+    print("[model_lgbm_v1] building matrices X/y/groups...")
     X = df[feature_cols].fillna(0.0).to_numpy(dtype=float)
     y = df["session_value"].to_numpy(dtype=float)
     groups = df["user_id"].to_numpy()
+    print(f"[model_lgbm_v1] X shape: {X.shape}, y: {y.shape}, groups: {groups.shape}")
 
     # LightGBM import
-    try:
-        import lightgbm as lgb
-        from lightgbm import LGBMRegressor
-    except Exception as e:
-        raise RuntimeError("LightGBM import edilemedi. Lütfen 'pip install lightgbm' kurun.") from e
+    if backend == "lgbm":
+        print("[model_lgbm_v1] importing LightGBM...")
+        # Olası OpenMP/threads kilitlenmelerini azaltmak için thread sayısını kısıtla
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        try:
+            import lightgbm as lgb
+            from lightgbm import LGBMRegressor
+        except Exception as e:
+            raise RuntimeError("LightGBM import edilemedi. Lütfen 'pip install lightgbm' kurun.") from e
+        print("[model_lgbm_v1] LightGBM imported")
+    elif backend == "xgb":
+        print("[model_lgbm_v1] importing XGBoost...")
+        try:
+            import xgboost as xgb
+        except Exception as e:
+            raise RuntimeError("XGBoost import edilemedi. Lütfen 'pip install xgboost' kurun.") from e
+        print("[model_lgbm_v1] XGBoost imported")
+    elif backend == "sk":
+        print("[model_lgbm_v1] importing scikit-learn (HistGradientBoosting)...")
+        try:
+            from sklearn.ensemble import HistGradientBoostingRegressor
+        except Exception as e:
+            raise RuntimeError("scikit-learn import edilemedi. Lütfen 'pip install scikit-learn' kurun.") from e
+        print("[model_lgbm_v1] scikit-learn imported")
+    else:
+        raise ValueError(f"Bilinmeyen backend: {backend}")
 
     print(f"[model_lgbm_v1] features: {len(feature_cols)} cols, samples: {len(y)}")
 
     oof = np.zeros_like(y, dtype=float)
     test_pred = np.zeros(len(feat_te), dtype=float)
-    # Test özellik matrisini bir kez hazırla
-    X_te = feat_te[feature_cols].fillna(0.0).to_numpy(dtype=float)
+    # Test özellik matrisini ve user_id'leri bir kez hazrla
+    X_te_base = feat_te[feature_cols].fillna(0.0).to_numpy(dtype=float)
+    user_id_te = feat_te["user_id"].to_numpy()
 
     fold_scores: List[float] = []
     for i, (tr_idx, va_idx) in enumerate(group_kfold_indices(groups, N_SPLITS, RANDOM_SEED), start=1):
         X_tr, y_tr = X[tr_idx], y[tr_idx]
         X_va, y_va = X[va_idx], y[va_idx]
 
-        model = LGBMRegressor(
-            random_state=RANDOM_SEED,
-            n_estimators=1500,
-            learning_rate=0.05,
-            num_leaves=31,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            n_jobs=-1,
-        )
+        # Kullanıcı bazlı backoff ortalaması (sadece bu fold'un train kısmından)
+        tr_users = pd.Series(groups[tr_idx], name="user_id")
+        va_users = pd.Series(groups[va_idx], name="user_id")
+        df_mu = pd.DataFrame({"user_id": tr_users, "y": y_tr}).groupby("user_id")["y"].mean()
+        global_mu = float(y_tr.mean())
+        backoff_tr = tr_users.map(df_mu).fillna(global_mu).to_numpy(dtype=float)
+        backoff_va = va_users.map(df_mu).fillna(global_mu).to_numpy(dtype=float)
+        # Test için de aynı fold train'inden üret
+        backoff_te = pd.Series(user_id_te).map(df_mu).fillna(global_mu).to_numpy(dtype=float)
 
-        print(f"[model_lgbm_v1] training fold {i}...")
-        callbacks = [
-            lgb.early_stopping(stopping_rounds=50, verbose=True),
-            lgb.log_evaluation(period=100),
-        ]
-        model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_va, y_va)],
-            eval_metric="l2",
-            callbacks=callbacks,
-        )
+        # X'lere ekle
+        X_tr = np.hstack([X_tr, backoff_tr.reshape(-1, 1)])
+        X_va = np.hstack([X_va, backoff_va.reshape(-1, 1)])
+        X_te = np.hstack([X_te_base, backoff_te.reshape(-1, 1)])
+
+        if backend == "lgbm":
+            model = LGBMRegressor(
+                random_state=RANDOM_SEED,
+                n_estimators=1500,
+                learning_rate=0.05,
+                num_leaves=31,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                n_jobs=-1,
+            )
+            print(f"[model_lgbm_v1] training fold {i}...")
+            callbacks = [
+                lgb.early_stopping(stopping_rounds=50, verbose=True),
+                lgb.log_evaluation(period=100),
+            ]
+            model.fit(
+                X_tr, y_tr,
+                eval_set=[(X_va, y_va)],
+                eval_metric="l2",
+                callbacks=callbacks,
+            )
+        elif backend == "xgb":
+            # XGBoost Regresör; benzer parametreler ve early stopping
+            model = xgb.XGBRegressor(
+                random_state=RANDOM_SEED,
+                n_estimators=1500,
+                learning_rate=0.05,
+                max_depth=6,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                tree_method="hist",
+                n_jobs=0,
+            )
+            print(f"[model_lgbm_v1] training fold {i} (XGB)...")
+            model.fit(
+                X_tr, y_tr,
+                eval_set=[(X_va, y_va)],
+                eval_metric="rmse",
+                early_stopping_rounds=50,
+                verbose=100,
+            )
+        else:  # sklearn HistGradientBoosting
+            model = HistGradientBoostingRegressor(
+                learning_rate=0.05,
+                max_iter=500,
+                max_leaf_nodes=31,
+                min_samples_leaf=20,
+                l2_regularization=0.0,
+                early_stopping=True,
+                n_iter_no_change=50,
+                validation_fraction=0.2,
+                random_state=RANDOM_SEED,
+            )
+            print(f"[model_lgbm_v1] training fold {i} (SK-HGB)...")
+            model.fit(X_tr, y_tr)
+            print(f"[model_lgbm_v1] fold {i} training done (SK-HGB)")
         # Not: early_stopping_rounds ile en iyi iterasyona göre duracaktır.
 
         pred_va = model.predict(X_va)
         oof[va_idx] = pred_va
         fold_mse = mse(y_va, pred_va)
         fold_scores.append(fold_mse)
-        print(f"Fold {i}: val_MSE={fold_mse:.6f} (n_tr={len(tr_idx)} n_va={len(va_idx)})")
+    print(f"Fold {i}: val_MSE={fold_mse:.6f} (n_tr={len(tr_idx)} n_va={len(va_idx)})")
 
     # Test tahmini (best_iteration_ varsa kullanır)
     test_pred += model.predict(X_te) / N_SPLITS
@@ -173,7 +253,13 @@ def main() -> int:
     sub["session_value"] = sub["user_session"].map(pred_map).astype(float)
 
     os.makedirs(SUB_DIR, exist_ok=True)
-    out_csv = os.path.join(SUB_DIR, "lgbm_v1_minimal.csv")
+    out_name_map = {
+        "lgbm": "lgbm_v1_minimal_nobuy_backoff.csv",
+        "xgb": "xgb_v1_minimal_nobuy_backoff.csv",
+        "sk": "sk_v1_minimal_nobuy_backoff.csv",
+    }
+    out_name = out_name_map.get(backend, "model_v1_minimal_nobuy_backoff.csv")
+    out_csv = os.path.join(SUB_DIR, out_name)
     sub.to_csv(out_csv, index=False)
     print({
         "oof_mse": round(oof_mse, 6),
