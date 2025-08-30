@@ -115,6 +115,7 @@ def mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def main() -> int:
     backend = os.getenv("MODEL_BACKEND", "lgbm").strip().lower()
     target_transform = os.getenv("TARGET_TRANSFORM", "log1p").strip().lower()
+    full_train = os.getenv("FULL_TRAIN", "0").strip() in {"1", "true", "yes"}
     print(f"[model_lgbm_v1] reading data and features... (backend={backend})")
     train_events, test_events, sample_sub = _read_raw()
     feat_tr = _read_features("session_features_v1_train")
@@ -195,13 +196,85 @@ def main() -> int:
             return np.expm1(arr)
         return arr
 
-    oof = np.zeros_like(y, dtype=float)
-    test_pred = np.zeros(len(feat_te), dtype=float)
-    # Test özellik matrisini ve user_id'leri bir kez hazrla
+    # Ortak test matrisi
     X_te_base = feat_te[feature_cols].fillna(0.0).to_numpy(dtype=float)
     user_id_te = feat_te["user_id"].to_numpy()
-    last_prod_te = feat_te["last_product_id"].to_numpy()
-    last_cat_te = feat_te["last_category_id"].to_numpy()
+    last_prod_te = feat_te.get("last_product_id", pd.Series(index=feat_te.index)).to_numpy()
+    last_cat_te = feat_te.get("last_category_id", pd.Series(index=feat_te.index)).to_numpy()
+
+    # FULL_TRAIN kipi: tek model, tüm train ile eğitim
+    if full_train:
+        print("[model_lgbm_v1] FULL_TRAIN=1 — tek modelle tüm train üzerinde eğitim")
+        # User backoff (tüm train'den)
+        df_mu_all = pd.DataFrame({"user_id": df["user_id"].to_numpy(), "y": y}).groupby("user_id")["y"].mean()
+        global_mu_all = float(y.mean())
+        backoff_tr_all = pd.Series(df["user_id"].to_numpy()).map(df_mu_all).fillna(global_mu_all).to_numpy(dtype=float)
+        backoff_te_all = pd.Series(user_id_te).map(df_mu_all).fillna(global_mu_all).to_numpy(dtype=float)
+
+        X_full = np.hstack([X, backoff_tr_all.reshape(-1, 1)])
+        X_te = np.hstack([X_te_base, backoff_te_all.reshape(-1, 1)])
+
+        # Model seçimi
+        if backend == "sk":
+            from sklearn.ensemble import HistGradientBoostingRegressor
+            model = HistGradientBoostingRegressor(
+                learning_rate=0.05,
+                max_iter=700,
+                max_leaf_nodes=63,
+                min_samples_leaf=20,
+                l2_regularization=0.0,
+                early_stopping=True,
+                n_iter_no_change=30,
+                validation_fraction=0.2,
+                random_state=RANDOM_SEED,
+            )
+        elif backend == "xgb":
+            import xgboost as xgb
+            model = xgb.XGBRegressor(
+                random_state=RANDOM_SEED,
+                n_estimators=1800,
+                learning_rate=0.05,
+                max_depth=7,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                tree_method="hist",
+                n_jobs=0,
+            )
+        else:
+            from lightgbm import LGBMRegressor
+            model = LGBMRegressor(
+                random_state=RANDOM_SEED,
+                n_estimators=2000,
+                learning_rate=0.05,
+                num_leaves=63,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                n_jobs=-1,
+            )
+
+        print("[model_lgbm_v1] fitting full-train model...")
+        model.fit(X_full, _tf_y(y))
+        test_pred = _inv_y(model.predict(X_te))
+
+        # Submission yazımı
+        print("[model_lgbm_v1] writing submission (FULL_TRAIN)...")
+        sub = sample_sub.copy()
+        pred_map = dict(zip(feat_te["user_session"].values, test_pred))
+        sub["session_value"] = sub["user_session"].map(pred_map).astype(float)
+        if sub["session_value"].isna().any():
+            sub["session_value"].fillna(float(y.mean()), inplace=True)
+        os.makedirs(SUB_DIR, exist_ok=True)
+        out_csv = os.path.join(SUB_DIR, f"{backend}_v1_fulltrain_buy_backoff_log.csv")
+        sub.to_csv(out_csv, index=False)
+        print({
+            "submission": out_csv,
+            "n_features": X_full.shape[1],
+        })
+        return 0
+
+    # CV yolu
+    oof = np.zeros_like(y, dtype=float)
+    test_pred = np.zeros(len(feat_te), dtype=float)
 
     fold_scores: List[float] = []
     for i, (tr_idx, va_idx) in enumerate(group_kfold_indices(groups, N_SPLITS, RANDOM_SEED), start=1):
