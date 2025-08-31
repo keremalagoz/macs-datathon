@@ -217,9 +217,26 @@ def main() -> int:
         global_mu_all = float(y.mean())
         backoff_tr_all = pd.Series(df["user_id"].to_numpy()).map(df_mu_all).fillna(global_mu_all).to_numpy(dtype=float)
         backoff_te_all = pd.Series(user_id_te).map(df_mu_all).fillna(global_mu_all).to_numpy(dtype=float)
+        # Product/Category target means (tüm train'den) — last item'a göre
+        prod_mu_all = pd.DataFrame({"pid": pd.Series(last_prod), "y": y}).groupby("pid")["y"].mean()
+        cat_mu_all = pd.DataFrame({"cid": pd.Series(last_cat), "y": y}).groupby("cid")["y"].mean()
+        prod_tr_all = pd.Series(last_prod).map(prod_mu_all).fillna(global_mu_all).to_numpy(dtype=float)
+        cat_tr_all = pd.Series(last_cat).map(cat_mu_all).fillna(global_mu_all).to_numpy(dtype=float)
+        prod_te_all = pd.Series(last_prod_te).map(prod_mu_all).fillna(global_mu_all).to_numpy(dtype=float)
+        cat_te_all = pd.Series(last_cat_te).map(cat_mu_all).fillna(global_mu_all).to_numpy(dtype=float)
 
-        X_full = np.hstack([X, backoff_tr_all.reshape(-1, 1)])
-        X_te = np.hstack([X_te_base, backoff_te_all.reshape(-1, 1)])
+        X_full = np.hstack([
+            X,
+            backoff_tr_all.reshape(-1, 1),
+            prod_tr_all.reshape(-1, 1),
+            cat_tr_all.reshape(-1, 1),
+        ])
+        X_te = np.hstack([
+            X_te_base,
+            backoff_te_all.reshape(-1, 1),
+            prod_te_all.reshape(-1, 1),
+            cat_te_all.reshape(-1, 1),
+        ])
 
         # Model seçimi
         if backend == "sk":
@@ -347,16 +364,11 @@ def main() -> int:
                 subsample=0.9,
                 colsample_bytree=0.9,
                 tree_method="hist",
-                n_jobs=0,
+        n_jobs=0,
+        eval_metric="rmse",
             )
             print(f"[model_lgbm_v1] training fold {i} (XGB)...")
-            model.fit(
-                X_tr, _tf_y(y_tr),
-                eval_set=[(X_va, _tf_y(y_va))],
-                eval_metric="rmse",
-                early_stopping_rounds=50,
-                verbose=100,
-            )
+            model.fit(X_tr, _tf_y(y_tr))
     else:  # sklearn HistGradientBoosting
             model = HistGradientBoostingRegressor(
                 learning_rate=0.05,
