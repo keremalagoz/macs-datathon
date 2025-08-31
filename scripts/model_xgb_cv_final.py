@@ -135,19 +135,28 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
     from xgboost import XGBRegressor
 
     t0 = time.time()
+    print("[1/7] Reading raw events...", flush=True)
     train_ev, test_ev, sub = read_events()
+    print(f"  train_ev: {train_ev.shape}, test_ev: {test_ev.shape}", flush=True)
     labels = build_session_labels(train_ev)
+    print(f"  labels: {labels.shape}", flush=True)
 
+    print("[2/7] Loading processed features...", flush=True)
     feat_tr, feat_te = _load_features()
+    print(f"  feat_tr: {feat_tr.shape}, feat_te: {feat_te.shape}", flush=True)
 
     # Last items for TE
+    print("[3/7] Computing last items per session...", flush=True)
     last_tr = last_items_per_session(train_ev)
     last_te = last_items_per_session(test_ev)
+    print(f"  last_tr: {last_tr.shape}, last_te: {last_te.shape}", flush=True)
 
     # Merge labels + features + last ids
+    print("[4/7] Merging labels, features, last ids...", flush=True)
     df_tr = labels.merge(feat_tr, on=["user_id", "user_session"], how="left")
     df_tr = df_tr.merge(last_tr, on=["user_id", "user_session"], how="left")
     df_te = feat_te.merge(last_te, on=["user_id", "user_session"], how="left")
+    print(f"  df_tr: {df_tr.shape}, df_te: {df_te.shape}", flush=True)
 
     # Keys
     key_cols = ["user_id", "user_session"]
@@ -169,6 +178,7 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
         y_raw = np.clip(y_raw, lo, hi)
         print(f"Winsorized target at p={win_p}: lo={lo:.4f}, hi={hi:.4f}")
     df_tr["y"] = np.log1p(y_raw)
+    print("[5/7] Target transformed (log1p)" + (f" with winsor p={win_p}" if 0.0 < win_p < 1.0 else ""), flush=True)
 
     # Feature columns
     drop_cols = set(key_cols + [target, "y"])  # keep last_* for TE reference but not as raw unless helpful
@@ -176,6 +186,12 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
     for c in ["last_product_id", "last_category_id"]:
         drop_cols.add(c)
     feature_cols = [c for c in df_tr.columns if c not in drop_cols]
+    # Coerce boolean to numeric
+    for c in feature_cols:
+        if df_tr[c].dtype == bool:
+            df_tr[c] = df_tr[c].astype(np.uint8)
+            df_te[c] = df_te[c].astype(np.uint8)
+    print(f"  Using {len(feature_cols)} base features", flush=True)
 
     # Prepare containers
     oof = np.zeros(len(df_tr), dtype=float)
@@ -186,8 +202,26 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
 
     groups = df_tr["user_id"].values
 
+    # GPU control via env
+    env_try_gpu = os.getenv("TRY_GPU", "1").strip()
+    try_gpu_default = env_try_gpu not in ("0", "false", "False", "NO", "no")
+    # Probe GPU capability once with a tiny fit if requested
+    gpu_available = False
+    if try_gpu_default:
+        try:
+            from xgboost import XGBRegressor as _ProbeReg
+            _probe = _ProbeReg(tree_method="gpu_hist", predictor="gpu_predictor", n_estimators=1, max_depth=1)
+            _probe.fit(np.array([[0.0],[1.0]], dtype=np.float32), np.array([0.0,1.0], dtype=np.float32))
+            gpu_available = True
+            print("[GPU] CUDA training available.", flush=True)
+        except Exception:
+            print("[GPU] CUDA not available or xgboost not built with GPU. Falling back to CPU.", flush=True)
+            gpu_available = False
+
+    overall = tqdm(total=n_splits * len(seeds), desc="CV progress", dynamic_ncols=True)
+
     for si, seed in enumerate(seeds, 1):
-        try_gpu = True
+        try_gpu = gpu_available
         params = xgb_params_base(seed, try_gpu=try_gpu)
         gkf = GroupKFold(n_splits=n_splits)
         fold = 0
@@ -284,12 +318,17 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
             print(f"Seed {seed} Fold {fold}/{n_splits} RMSE={rmse:.6f} ES={'Y' if used_es else 'N'} Trees={getattr(model, 'best_iteration', params['n_estimators'])}")
             try:
                 pbar.update(1)
+                overall.update(1)
             except Exception:
                 pass
         try:
             pbar.close()
         except Exception:
             pass
+    try:
+        overall.close()
+    except Exception:
+        pass
 
     # Average over seeds and folds
     S = len(seeds)
@@ -325,7 +364,7 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
     merged.to_csv(out_path, index=False)
 
     # Report
-    print({"oof_rmse_log": oof_rmse, "submission": out_path, "n_rows": len(merged)})
+    print({"oof_rmse_log": oof_rmse, "submission": out_path, "n_rows": len(merged), "sec": round(time.time()-t0,2)})
     return out_path
 
 
