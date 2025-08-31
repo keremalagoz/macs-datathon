@@ -106,19 +106,33 @@ def add_user_backoff(train_df: pd.DataFrame, target_col: str) -> pd.Series:
 
 
 def xgb_params_base(seed: int, try_gpu: bool = True) -> dict:
+    def _get_float(name, default):
+        v = os.getenv(name)
+        try:
+            return float(v) if v is not None else default
+        except Exception:
+            return default
+    def _get_int(name, default):
+        v = os.getenv(name)
+        try:
+            return int(v) if v is not None else default
+        except Exception:
+            return default
+
     params = dict(
-        n_estimators=30000,
-        learning_rate=0.03,
-        max_depth=9,
-        min_child_weight=6,
-        subsample=0.8,
-        colsample_bytree=0.7,
-        gamma=0.0,
-        reg_lambda=1.2,
-        reg_alpha=0.0,
+        n_estimators=_get_int("N_ESTIMATORS", 30000),
+        learning_rate=_get_float("LEARNING_RATE", 0.03),
+        max_depth=_get_int("MAX_DEPTH", 9),
+        min_child_weight=_get_int("MIN_CHILD_WEIGHT", 6),
+        subsample=_get_float("SUBSAMPLE", 0.8),
+        colsample_bytree=_get_float("COLSAMPLE_BYTREE", 0.7),
+        gamma=_get_float("GAMMA", 0.0),
+        reg_lambda=_get_float("REG_LAMBDA", 1.2),
+        reg_alpha=_get_float("REG_ALPHA", 0.0),
         random_state=seed,
         n_jobs=os.cpu_count() or 8,
         eval_metric="rmse",
+        verbosity=1,
     )
     if try_gpu:
         params.update(dict(tree_method="gpu_hist", predictor="gpu_predictor"))
@@ -272,6 +286,7 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
             y_va = va_df["y"].to_numpy(dtype=np.float32)
             X_te = te_df[num_cols].fillna(0.0).to_numpy(dtype=np.float32)
 
+            print(f"[Train] Seed {seed} Fold {fold}: fitting XGB (n_estimators={params['n_estimators']}, lr={params['learning_rate']}, depth={params['max_depth']}, gpu={params.get('tree_method')=='gpu_hist'})", flush=True)
             model = XGBRegressor(**params)
 
             # Try early stopping with eval_set; fallback if not supported
