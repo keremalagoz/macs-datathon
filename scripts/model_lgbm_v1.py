@@ -115,6 +115,7 @@ def mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def main() -> int:
     backend = os.getenv("MODEL_BACKEND", "lgbm").strip().lower()
     target_transform = os.getenv("TARGET_TRANSFORM", "log1p").strip().lower()
+    winsorize_p = float(os.getenv("WINSORIZE_P", "0"))  # 0: kapalı, ör: 0.995 üstünü kırp
     full_train = os.getenv("FULL_TRAIN", "0").strip() in {"1", "true", "yes"}
     print(f"[model_lgbm_v1] reading data and features... (backend={backend})")
     train_events, test_events, sample_sub = _read_raw()
@@ -203,6 +204,12 @@ def main() -> int:
             return np.expm1(arr)
         return arr
 
+    def _winsorize(vec: np.ndarray, p: float) -> np.ndarray:
+        if p and 0.5 < p < 1.0:
+            hi = float(np.quantile(vec, p))
+            return np.minimum(vec, hi)
+        return vec
+
     # Ortak test matrisi
     X_te_base = feat_te[feature_cols].fillna(0.0).to_numpy(dtype=float)
     user_id_te = feat_te["user_id"].to_numpy()
@@ -256,13 +263,17 @@ def main() -> int:
             import xgboost as xgb
             model = xgb.XGBRegressor(
                 random_state=RANDOM_SEED,
-                n_estimators=1800,
-                learning_rate=0.05,
-                max_depth=7,
-                subsample=0.9,
-                colsample_bytree=0.9,
+                n_estimators=3500,
+                learning_rate=0.03,
+                max_depth=8,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                min_child_weight=10,
+                reg_alpha=0.1,
+                reg_lambda=1.0,
                 tree_method="hist",
                 n_jobs=0,
+                eval_metric="rmse",
             )
         else:
             from lightgbm import LGBMRegressor
@@ -277,7 +288,8 @@ def main() -> int:
             )
 
         print("[model_lgbm_v1] fitting full-train model...")
-        model.fit(X_full, _tf_y(y))
+        y_full = _winsorize(y, winsorize_p)
+        model.fit(X_full, _tf_y(y_full))
         test_pred = _inv_y(model.predict(X_te))
 
         # Submission yazımı
@@ -288,7 +300,8 @@ def main() -> int:
         if sub["session_value"].isna().any():
             sub["session_value"].fillna(float(y.mean()), inplace=True)
         os.makedirs(SUB_DIR, exist_ok=True)
-        out_csv = os.path.join(SUB_DIR, f"{backend}_v1_fulltrain_buy_backoff_log.csv")
+        suffix = "_win" + str(winsorize_p) if winsorize_p and winsorize_p > 0 else ""
+        out_csv = os.path.join(SUB_DIR, f"{backend}_v1_fulltrain_buy_backoff_log{suffix}.csv")
         sub.to_csv(out_csv, index=False)
         print({
             "submission": out_csv,
