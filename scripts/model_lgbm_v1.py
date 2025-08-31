@@ -118,9 +118,16 @@ def main() -> int:
     full_train = os.getenv("FULL_TRAIN", "0").strip() in {"1", "true", "yes"}
     print(f"[model_lgbm_v1] reading data and features... (backend={backend})")
     train_events, test_events, sample_sub = _read_raw()
-    feat_tr = _read_features("session_features_v1_train")
-    feat_te = _read_features("session_features_v1_test")
-    print(f"[model_lgbm_v1] features loaded: train_feat={feat_tr.shape} test_feat={feat_te.shape}")
+    # Özellik versiyonu: önce v2 dene, yoksa v1'e düş
+    try:
+        feat_tr = _read_features("session_features_v2_train")
+        feat_te = _read_features("session_features_v2_test")
+        feat_ver = "v2"
+    except FileNotFoundError:
+        feat_tr = _read_features("session_features_v1_train")
+        feat_te = _read_features("session_features_v1_test")
+        feat_ver = "v1"
+    print(f"[model_lgbm_v1] features loaded ({feat_ver}): train_feat={feat_tr.shape} test_feat={feat_te.shape}")
 
     print("[model_lgbm_v1] building session labels and merging features...")
     labels = build_session_labels(train_events)
