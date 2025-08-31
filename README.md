@@ -36,3 +36,15 @@ Bu repo, BTK Datathon 2025 (Kaggle) yarışması için uçtan uca ML pipeline ç
 EDA → Data Cleaning → Feature Engineering → Modeling → Ensemble → Submission
 
 Leaderboard’a erken submission yapıp iteratif geliştirme hedeflenir.
+
+## Hızlı Başlangıç
+- Gereksinimler: `pip install -r requirements.txt`
+- Veri: `data/raw/` klasörüne train/test/sample_submission yerleştir.
+- Final modeli çalıştır:
+  - `set PYTHONUNBUFFERED=1`
+  - `set TRY_GPU=0`
+  - `set WINSORIZE_P=0.995`
+  - `set N_ESTIMATORS=20000`
+  - `python -u scripts\model_final_fulltrain.py`
+
+Detaylar: `docs/FINAL_REPORT.md`, `docs/HOW_TO_RUN.md`, `docs/CHANGELOG.md`.
