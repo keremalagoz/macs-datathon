@@ -16,6 +16,34 @@ except Exception:  # pragma: no cover
         # Fallback no-op tqdm
         return iterable if iterable is not None else range(total or 0)
 
+# Optional XGBoost tqdm callback
+class _TqdmCallback:
+    def __init__(self, total: int, desc: str):
+        self.total = int(total)
+        self.desc = desc
+        self._pbar = None
+    # XGBoost TrainingCallback API (duck-typed to avoid hard dependency if missing)
+    def before_training(self, model):
+        try:
+            self._pbar = tqdm(total=self.total, desc=self.desc, leave=False)
+        except Exception:
+            self._pbar = None
+        return model
+    def after_iteration(self, model, epoch: int, evals_log):
+        try:
+            if self._pbar:
+                self._pbar.update(1)
+        except Exception:
+            pass
+        return False  # do not stop
+    def after_training(self, model):
+        try:
+            if self._pbar:
+                self._pbar.close()
+        except Exception:
+            pass
+        return model
+
 # -----------------------------
 # Utils
 # -----------------------------
@@ -292,12 +320,20 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
             # Try early stopping with eval_set; fallback if not supported
             used_es = True
             try:
+                # Try with per-iteration tqdm callback
+                callbacks = []
+                try:
+                    from xgboost.callback import TrainingCallback  # type: ignore
+                    callbacks = [ _TqdmCallback(total=params['n_estimators'], desc=f"Seed {seed} Fold {fold} trees") ]
+                except Exception:
+                    callbacks = []
                 model.fit(
                     X_tr,
                     y_tr,
                     eval_set=[(X_va, y_va)],
                     verbose=False,
                     early_stopping_rounds=early_stopping,
+                    callbacks=callbacks if callbacks else None,
                 )
             except TypeError:
                 # Older API signature
@@ -309,12 +345,19 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
                     params = xgb_params_base(seed, try_gpu=False)
                     model = XGBRegressor(**params)
                     try:
+                        callbacks = []
+                        try:
+                            from xgboost.callback import TrainingCallback  # type: ignore
+                            callbacks = [ _TqdmCallback(total=params['n_estimators'], desc=f"Seed {seed} Fold {fold} trees") ]
+                        except Exception:
+                            callbacks = []
                         model.fit(
                             X_tr,
                             y_tr,
                             eval_set=[(X_va, y_va)],
                             verbose=False,
                             early_stopping_rounds=early_stopping,
+                            callbacks=callbacks if callbacks else None,
                         )
                         used_es = True
                     except TypeError:
