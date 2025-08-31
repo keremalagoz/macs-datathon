@@ -369,5 +369,22 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
 
 
 if __name__ == "__main__":
-    out = run_cv_ensemble()
-    print("Wrote:", out)
+    print("[0/7] Starting model_xgb_cv_final.py", flush=True)
+    # Allow quick debug via env overrides
+    max_folds_env = os.getenv("MAX_FOLDS")
+    max_seeds_env = os.getenv("MAX_SEEDS")
+    if max_folds_env or max_seeds_env:
+        try:
+            mf = int(max_folds_env) if max_folds_env else 10
+            ms = int(max_seeds_env) if max_seeds_env else 3
+            seeds = (2025, 2027, 2031)[:ms]
+            print(f"[DEBUG] Running with MAX_FOLDS={mf}, MAX_SEEDS={ms}", flush=True)
+            def _run():
+                return run_cv_ensemble(seeds=seeds, n_splits=mf)
+            out = _run()
+        except Exception as e:
+            print(f"[FATAL] Exception before training: {e}", flush=True)
+            raise
+    else:
+        out = run_cv_ensemble()
+    print("Wrote:", out, flush=True)
