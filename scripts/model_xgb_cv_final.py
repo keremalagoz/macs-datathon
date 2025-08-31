@@ -244,7 +244,7 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
 
     groups = df_tr["user_id"].values
 
-    # GPU control via env
+        # GPU control via env
     env_try_gpu = os.getenv("TRY_GPU", "1").strip()
     try_gpu_default = env_try_gpu not in ("0", "false", "False", "NO", "no")
     # Probe GPU capability once with a tiny fit if requested
@@ -262,6 +262,7 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
 
     overall = tqdm(total=n_splits * len(seeds), desc="CV progress", dynamic_ncols=True)
 
+    use_native = os.getenv("USE_XGB_NATIVE", "1").strip() not in ("0","false","False","no","NO")
     for si, seed in enumerate(seeds, 1):
         try_gpu = gpu_available
         params = xgb_params_base(seed, try_gpu=try_gpu)
@@ -314,60 +315,97 @@ def run_cv_ensemble(seeds=(2025, 2027, 2031), n_splits=10, early_stopping=300) -
             y_va = va_df["y"].to_numpy(dtype=np.float32)
             X_te = te_df[num_cols].fillna(0.0).to_numpy(dtype=np.float32)
 
-            print(f"[Train] Seed {seed} Fold {fold}: fitting XGB (n_estimators={params['n_estimators']}, lr={params['learning_rate']}, depth={params['max_depth']}, gpu={params.get('tree_method')=='gpu_hist'})", flush=True)
-            model = XGBRegressor(**params)
+            print(f"[Train] Seed {seed} Fold {fold}: fitting XGB (n_estimators={params['n_estimators']}, lr={params['learning_rate']}, depth={params['max_depth']}, gpu={params.get('tree_method')=='gpu_hist'}, native={use_native})", flush=True)
 
-            # Try early stopping with eval_set; fallback if not supported
             used_es = True
-            try:
-                # Try with per-iteration tqdm callback
-                callbacks = []
-                try:
-                    from xgboost.callback import TrainingCallback  # type: ignore
-                    callbacks = [ _TqdmCallback(total=params['n_estimators'], desc=f"Seed {seed} Fold {fold} trees") ]
-                except Exception:
-                    callbacks = []
-                model.fit(
-                    X_tr,
-                    y_tr,
-                    eval_set=[(X_va, y_va)],
-                    verbose=False,
-                    early_stopping_rounds=early_stopping,
-                    callbacks=callbacks if callbacks else None,
-                )
-            except TypeError:
-                # Older API signature
-                used_es = False
-                model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-            except Exception as e:
-                # Possibly GPU not available; fallback to CPU and retry once
-                if params.get("tree_method") == "gpu_hist":
-                    params = xgb_params_base(seed, try_gpu=False)
-                    model = XGBRegressor(**params)
-                    try:
-                        callbacks = []
-                        try:
-                            from xgboost.callback import TrainingCallback  # type: ignore
-                            callbacks = [ _TqdmCallback(total=params['n_estimators'], desc=f"Seed {seed} Fold {fold} trees") ]
-                        except Exception:
-                            callbacks = []
-                        model.fit(
-                            X_tr,
-                            y_tr,
-                            eval_set=[(X_va, y_va)],
-                            verbose=False,
-                            early_stopping_rounds=early_stopping,
-                            callbacks=callbacks if callbacks else None,
-                        )
-                        used_es = True
-                    except TypeError:
-                        used_es = False
-                        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-                else:
-                    raise e
+            va_pred = None
+            te_pred = None
 
-            va_pred = model.predict(X_va)
-            te_pred = model.predict(X_te)
+            if use_native:
+                try:
+                    import xgboost as xgb
+                    dtr = xgb.DMatrix(X_tr, label=y_tr)
+                    dva = xgb.DMatrix(X_va, label=y_va)
+                    dte = xgb.DMatrix(X_te)
+                    xgb_params = {
+                        'objective': 'reg:squarederror',
+                        'eta': params['learning_rate'],
+                        'max_depth': params['max_depth'],
+                        'min_child_weight': params['min_child_weight'],
+                        'subsample': params['subsample'],
+                        'colsample_bytree': params['colsample_bytree'],
+                        'gamma': params['gamma'],
+                        'lambda': params['reg_lambda'],
+                        'alpha': params['reg_alpha'],
+                        'seed': params['random_state'],
+                        'eval_metric': 'rmse',
+                        'tree_method': 'gpu_hist' if params.get('tree_method')=='gpu_hist' else 'hist',
+                        'predictor': 'gpu_predictor' if params.get('tree_method')=='gpu_hist' else 'auto',
+                        'nthread': params['n_jobs'],
+                        'verbosity': 1,
+                    }
+                    callbacks = []
+                    try:
+                        from xgboost.callback import TrainingCallback  # type: ignore
+                        callbacks = [ _TqdmCallback(total=params['n_estimators'], desc=f"Seed {seed} Fold {fold} trees") ]
+                    except Exception:
+                        callbacks = []
+                    bst = xgb.train(
+                        xgb_params,
+                        dtr,
+                        num_boost_round=int(params['n_estimators']),
+                        evals=[(dtr,'train'), (dva,'valid')],
+                        early_stopping_rounds=early_stopping,
+                        callbacks=callbacks if callbacks else None,
+                        verbose_eval=False,
+                    )
+                    best_it = getattr(bst, 'best_iteration', None)
+                    if best_it is None:
+                        best_it = int(params['n_estimators'])
+                    va_pred = bst.predict(dva, iteration_range=(0, best_it+1))
+                    te_pred = bst.predict(dte, iteration_range=(0, best_it+1))
+                except Exception as e:
+                    print(f"[NativeFail] {e}; falling back to sklearn API.", flush=True)
+                    use_native = False  # disable for the rest
+
+            if not use_native:
+                from xgboost import XGBRegressor
+                model = XGBRegressor(**params)
+                try:
+                    # per-iteration callback may or may not be supported
+                    callbacks = []
+                    try:
+                        from xgboost.callback import TrainingCallback  # type: ignore
+                        callbacks = [ _TqdmCallback(total=params['n_estimators'], desc=f"Seed {seed} Fold {fold} trees") ]
+                    except Exception:
+                        callbacks = []
+                    model.fit(
+                        X_tr,
+                        y_tr,
+                        eval_set=[(X_va, y_va)],
+                        verbose=False,
+                        early_stopping_rounds=early_stopping,
+                        callbacks=callbacks if callbacks else None,
+                    )
+                except TypeError:
+                    used_es = False
+                    model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+                except Exception as e:
+                    if params.get("tree_method") == "gpu_hist":
+                        params = xgb_params_base(seed, try_gpu=False)
+                        model = XGBRegressor(**params)
+                        try:
+                            model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False, early_stopping_rounds=early_stopping)
+                            used_es = True
+                        except TypeError:
+                            used_es = False
+                            model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+                    else:
+                        raise e
+                if va_pred is None:
+                    va_pred = model.predict(X_va)
+                if te_pred is None:
+                    te_pred = model.predict(X_te)
 
             oof[va_idx] += va_pred
             test_preds_acc += te_pred
