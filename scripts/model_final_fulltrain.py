@@ -231,12 +231,12 @@ def run_fulltrain() -> str:
     print("[6/6] Writing submission...", flush=True)
     pred = np.expm1(pred_log)
 
-    te_key = df_te[["user_id", "user_session"]].copy()
-    te_key["pred"] = pred
-    out = sub.merge(te_key, on=["user_id", "user_session"], how="left")
+    # Build submission using user_session-only mapping (sample_submission has no user_id)
+    pred_map = pd.Series(pred, index=df_te["user_session"]).to_dict()
+    out = sub.copy()
     global_mean = df_tr["session_value"].mean()
-    out["session_value"] = out["pred"].fillna(global_mean)
-    out = out[["user_id", "user_session", "session_value"]]
+    out["session_value"] = out["user_session"].map(pred_map).fillna(global_mean)
+    out = out[["user_session", "session_value"]]
 
     os.makedirs("submissions", exist_ok=True)
     suffix = ""
